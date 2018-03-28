@@ -18,7 +18,6 @@ import scala.concurrent.{ ExecutionContext, Future }
 import scala.concurrent.duration.Duration.Inf
 import scala.util.matching.Regex.MatchIterator
 import java.nio.file.{ Files, Paths }
-import sbt.StandardMain
 
 private[sbt] object Definition {
   import java.net.URI
@@ -258,6 +257,7 @@ private[sbt] object Definition {
                     requestId: String,
                     commandSource: CommandSource,
                     log: Logger)(implicit ec: ExecutionContext): Future[Unit] = Future {
+    import collection.JavaConverters._
     val LspDefinitionLogHead = "lsp-definition"
     import sjsonnew.support.scalajson.unsafe.CompactPrinter
     log.debug(s"$LspDefinitionLogHead json request: ${CompactPrinter(jsonDefinition)}")
@@ -283,24 +283,50 @@ private[sbt] object Definition {
         analyses
           .map { analyses =>
             val locations = analyses.par.flatMap { analysis =>
-              val selectPotentials = textProcessor.potentialClsOrTraitOrObj(sym)
-              val classes =
-                (analysis.apis.allInternalClasses ++ analysis.apis.allExternals).collect {
-                  selectPotentials
+              val names: Set[(String, String)] = definition.toSet.flatMap {
+                textDocumentPosition: TextDocumentPositionParams =>
+                  val uriString = textDocumentPosition.textDocument.uri
+                  val uri = URI.create(uriString)
+                  val sourceFile = IO.toFile(uri)
+                  val pos = textDocumentPosition.position
+                  analysis.infos
+                    .get(sourceFile)
+                    .getFullNameByPosition(pos.line.toInt + 1, pos.character.toInt + 1)
+                    .toOption
+                    .map { fullName: String =>
+                      fullName
+                        .split('.')
+                        .inits
+                        .map(_.mkString("."))
+                        .filter(_.nonEmpty)
+                        .map(initName => initName -> fullName)
+                        .toSet
+                    }
+                    .getOrElse(Set())
+              }
+
+              log.debug(s"$LspDefinitionLogHead potentials: $names")
+              names
+                .flatMap {
+                  case (className, fullName) =>
+                    (analysis.relations.definesClass(className) ++ analysis.relations
+                      .libraryDefinesClass(className))
+                      .flatMap { file =>
+                        log.debug(s"$LspDefinitionLogHead found name: $fullName at $file")
+                        val positions = analysis.infos
+                          .get(file)
+                          .getPositionByFullName(fullName)
+                        positions.asScala.map(np => (file, np))
+                      }
                 }
-              log.debug(s"$LspDefinitionLogHead potentials: $classes")
-              classes
-                .flatMap { className =>
-                  analysis.relations.definesClass(className) ++ analysis.relations
-                    .libraryDefinesClass(className)
-                }
-                .flatMap { classFile =>
-                  textProcessor.markPosition(classFile, sym).collect {
-                    case (file, line, from, to) =>
-                      import sbt.internal.langserver.{ Location, Position, Range }
-                      Location(IO.toURI(file).toString,
-                               Range(Position(line, from), Position(line, to)))
-                  }
+                .collect {
+                  case (classFile, namePosition) =>
+                    val line = namePosition.line - 1
+                    val from = namePosition.column - 1
+                    val to = from + namePosition.name.length
+                    import sbt.internal.langserver.{ Location, Position, Range }
+                    Location(IO.toURI(classFile).toString,
+                             Range(Position(line, from), Position(line, to)))
                 }
             }.seq
             log.debug(s"$LspDefinitionLogHead locations ${locations}")

@@ -256,53 +256,82 @@ private[sbt] object Definition {
       }
   }
 
-  def lspDefinition(
-      jsonDefinition: JValue,
-      requestId: String,
-      commandSource: CommandSource,
-      log: Logger,
-  )(implicit ec: ExecutionContext): Future[Unit] = Future {
+  def lspDefinition(jsonDefinition: JValue,
+                    requestId: String,
+                    commandSource: CommandSource,
+                    log: Logger)(implicit ec: ExecutionContext): Future[Unit] = Future {
+    import collection.JavaConverters._
     val LspDefinitionLogHead = "lsp-definition"
     val jsonDefinitionString = CompactPrinter(jsonDefinition)
     log.debug(s"$LspDefinitionLogHead json request: $jsonDefinitionString")
     lazy val analyses = getAnalyses
-    getDefinition(jsonDefinition)
-      .flatMap { definition =>
-        val uri = URI.create(definition.textDocument.uri)
-        Files
-          .lines(Paths.get(uri))
-          .skip(definition.position.line)
-          .findFirst
-          .toOption
-          .flatMap { line =>
-            log.debug(s"$LspDefinitionLogHead found line: $line")
-            textProcessor.identifier(line, definition.position.character.toInt)
-          }
-      } match {
+    val definition = getDefinition(jsonDefinition)
+    definition.flatMap { definition =>
+      val uri = URI.create(definition.textDocument.uri)
+      Files
+        .lines(Paths.get(uri))
+        .skip(definition.position.line)
+        .findFirst
+        .toOption
+        .flatMap { line =>
+          log.debug(s"$LspDefinitionLogHead found line: $line")
+          textProcessor.identifier(line, definition.position.character.toInt)
+        }
+    } match {
       case Some(sym) =>
         log.debug(s"symbol $sym")
         analyses
           .map { analyses =>
             val locations = analyses.par.flatMap { analysis =>
-              val selectPotentials = textProcessor.potentialClsOrTraitOrObj(sym)
-              val classes =
-                (analysis.apis.allInternalClasses ++ analysis.apis.allExternals).collect {
-                  selectPotentials
+              val names: Set[(String, String)] = definition.toSet.flatMap {
+                textDocumentPosition: TextDocumentPositionParams =>
+                  val uriString = textDocumentPosition.textDocument.uri
+                  val uri = URI.create(uriString)
+                  val sourceFile = IO.toFile(uri)
+                  val pos = textDocumentPosition.position
+                  analysis.infos
+                    .get(sourceFile)
+                    .getSymbolNameByPosition(pos.line.toInt, pos.character.toInt)
+                    .toOption
+                    .map { fullName: String =>
+                      fullName
+                        .split('#')
+                        .inits
+                        .map(_.mkString("#"))
+                        .filter(_.nonEmpty)
+                        .map(name =>
+                          if (name.startsWith("_root_.")) name.substring(7)
+                          else if (name.startsWith("_empty_.")) name.substring(8)
+                          else name)
+                        .map(name => if (name.last == '.') name.init else name)
+                        .map(initName => initName -> fullName)
+                        .toSet
+                    }
+                    .getOrElse(Set())
+              }
+
+              log.debug(s"$LspDefinitionLogHead potentials: $names")
+              names
+                .flatMap {
+                  case (className, fullName) =>
+                    (analysis.relations.definesClass(className) ++ analysis.relations
+                      .libraryDefinesClass(className))
+                      .flatMap { file =>
+                        log.debug(s"$LspDefinitionLogHead found name: $fullName at $file")
+                        val symbolOccurrences = analysis.infos
+                          .get(file)
+                          .getSymbolDefinition(fullName)
+                        symbolOccurrences.asScala.map(symbolOccurrence => (file, symbolOccurrence))
+                      }
                 }
-              log.debug(s"$LspDefinitionLogHead potentials: $classes")
-              classes
-                .flatMap { className =>
-                  analysis.relations.definesClass(className) ++
-                    analysis.relations.libraryDefinesClass(className)
-                }
-                .flatMap { classFile =>
-                  textProcessor.markPosition(classFile, sym).collect {
-                    case (file, line, from, to) =>
-                      Location(
-                        IO.toURI(file).toString,
-                        Range(Position(line, from), Position(line, to)),
-                      )
-                  }
+                .collect {
+                  case (classFile, symbolOccurrence) =>
+                    val line = symbolOccurrence.range.startLine()
+                    val from = symbolOccurrence.range.startCharacter
+                    val to = symbolOccurrence.range.endCharacter
+                    import sbt.internal.langserver.{ Location, Position, Range }
+                    Location(IO.toURI(classFile).toString,
+                             Range(Position(line, from), Position(line, to)))
                 }
             }.seq
             log.debug(s"$LspDefinitionLogHead locations $locations")
